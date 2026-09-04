@@ -19,7 +19,18 @@ from rasterio.io import MemoryFile
 from rasterio.warp import transform_bounds
 
 
-API_URL = os.getenv("SRM_API_URL", "http://127.0.0.1:8000/predict")
+
+def _get_api_url() -> str:
+    configured_url = os.getenv("SRM_API_URL")
+    if configured_url:
+        return configured_url
+    try:
+        return str(st.secrets["SRM_API_URL"])
+    except (FileNotFoundError, KeyError):
+        return "http://127.0.0.1:8000/predict"
+
+
+API_URL = _get_api_url()
 ProgressResult = TypeVar("ProgressResult")
 
 

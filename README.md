@@ -150,8 +150,8 @@ inference backend. A practical free setup is:
    launcher uses automatically. Copy the resulting HTTPS URL.
 2. Deploy the repository on [Streamlit Community Cloud](https://share.streamlit.io/)
    with main file `ui.py`.
-3. In the Streamlit app settings, add the environment variable
-   `SRM_API_URL=https://YOUR-RENDER-SERVICE.onrender.com/predict`.
+3. In the Streamlit app settings, add this secret:
+   `SRM_API_URL = "https://YOUR-RENDER-SERVICE.onrender.com/predict"`.
 4. Confirm the Render service's `/` URL returns its JSON status response, then
    upload a GeoTIFF in Streamlit.
 
