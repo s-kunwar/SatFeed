@@ -314,7 +314,7 @@ uploaded_file = st.file_uploader(
     help="The backend expects a four-band GeoTIFF (for example, RGB + NIR).",
 )
 
-demo_path = Path(__file__).resolve().parents[2] / "sample_lr.tif"
+demo_path = Path(__file__).resolve().parents[2] / "output" / "austin1og.jpg"
 demo_output_path = Path(__file__).resolve().parents[2] / "output" / "austin1up.jpg"
 if st.button(
     "Load Austin demo (fast presentation example)",
