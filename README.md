@@ -139,6 +139,27 @@ Open the URL printed by Streamlit, upload a `.tif` or `.tiff`, and select **Run 
 - a GeoJSON vector download; and
 - an interactive map overlay for extracted features.
 
+## Free online deployment
+
+The current architecture uses two services: a Streamlit frontend and a FastAPI
+inference backend. A practical free setup is:
+
+1. Deploy the repository's `app.py` as a Render **Free Web Service**.
+   Use build command `pip install -r requirements.txt` and start command
+   `python app.py`. Render provides the `PORT` environment variable, which the
+   launcher uses automatically. Copy the resulting HTTPS URL.
+2. Deploy the repository on [Streamlit Community Cloud](https://share.streamlit.io/)
+   with main file `ui.py`.
+3. In the Streamlit app settings, add the environment variable
+   `SRM_API_URL=https://YOUR-RENDER-SERVICE.onrender.com/predict`.
+4. Confirm the Render service's `/` URL returns its JSON status response, then
+   upload a GeoTIFF in Streamlit.
+
+Free services sleep when idle, so the first request can take a minute or more.
+They also use ephemeral disk storage; generated GeoTIFF and GeoJSON files are
+temporary download artifacts, not permanent storage. Large GeoTIFF inference
+may exceed free CPU/RAM/time limits.
+
 ### Optional: Generate training patches
 
 ```bash
