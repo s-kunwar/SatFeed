@@ -5,5 +5,7 @@ __pycache__/
 .pytest_cache/
 .streamlit/*
 !.streamlit/config.toml
-output/
+output/*
+!output/austin1og.jpg
+!output/austin1up.jpg
 kaggle.json

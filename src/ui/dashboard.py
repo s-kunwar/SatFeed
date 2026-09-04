@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 import numpy as np
+import cv2
 import pydeck as pdk
 import rasterio
 import streamlit as st
@@ -165,9 +166,15 @@ def _run_with_progress(
 
 def _raster_preview(raster_bytes: bytes) -> np.ndarray:
     """Build an RGB-compatible preview while preserving RGB channel relationships."""
-    with MemoryFile(raster_bytes) as memory_file:
-        with memory_file.open() as dataset:
-            bands = dataset.read()
+    try:
+        with MemoryFile(raster_bytes) as memory_file:
+            with memory_file.open() as dataset:
+                bands = dataset.read()
+    except rasterio.errors.RasterioIOError:
+        image = cv2.imdecode(np.frombuffer(raster_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise
+        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
     selected = bands[:3]
     if selected.shape[0] == 1:
@@ -308,25 +315,25 @@ uploaded_file = st.file_uploader(
 )
 
 demo_path = Path(__file__).resolve().parents[2] / "sample_lr.tif"
+demo_output_path = Path(__file__).resolve().parents[2] / "output" / "austin1up.jpg"
 if st.button(
     "Load Austin demo (fast presentation example)",
     use_container_width=True,
-    disabled=not demo_path.is_file(),
+    disabled=not demo_path.is_file() or not demo_output_path.is_file(),
 ):
-    st.session_state["demo_raster_bytes"] = demo_path.read_bytes()
-    st.session_state["demo_raster_name"] = "austin_demo.tif"
+    st.session_state["demo_selected"] = True
 
 if uploaded_file is not None:
     st.success(f"Ready: **{uploaded_file.name}** ({uploaded_file.size / 1024:.1f} KB)")
     st.caption("The input will be normalized before model inference.")
-elif "demo_raster_bytes" in st.session_state:
+elif st.session_state.get("demo_selected", False):
     st.success("Ready: **Austin demo** (included sample raster)")
     st.caption("The small demo is optimized for a quick presentation run.")
 st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown('<div class="satfeed-panel">', unsafe_allow_html=True)
 st.subheader("Processing")
-has_demo = "demo_raster_bytes" in st.session_state
+has_demo = st.session_state.get("demo_selected", False)
 run_inference = st.button(
     "Run SatFeed Super-Resolution",
     type="primary",
@@ -339,10 +346,21 @@ if run_inference and (uploaded_file is not None or has_demo):
     progress_bar = st.progress(0)
     status_text = st.empty()
     try:
+        if uploaded_file is None and has_demo:
+            payload = demo_path.read_bytes()
+            demo_output = demo_output_path.read_bytes()
+            st.session_state["srm_original"] = payload
+            st.session_state["srm_result"] = demo_output
+            st.session_state["srm_result_name"] = "austin_super_resolved.jpg"
+            st.session_state["srm_geojson"] = b'{"type":"FeatureCollection","features":[]}'
+            st.session_state["srm_geojson_name"] = "austin_demo_vectors.geojson"
+            st.session_state["srm_metrics"] = {"psnr_db": 0.0, "ssim": 0.0}
+            st.success("Austin demo loaded instantly from the included presentation outputs.")
+            st.rerun()
         payload = _run_with_progress(
             uploaded_file.getvalue
             if uploaded_file is not None
-            else lambda: st.session_state["demo_raster_bytes"],
+            else lambda: b"",
             0,
             15,
             "Stage 1/5: Loading GeoTIFF & Extracting RGB Bands...",
