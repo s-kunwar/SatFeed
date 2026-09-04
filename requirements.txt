@@ -1,0 +1,14 @@
+numpy
+torch
+torchvision
+rasterio
+scikit-image
+opencv-python-headless
+shapely
+geopandas
+fastapi
+uvicorn[standard]
+python-multipart
+requests
+streamlit
+pydeck
