@@ -3,35 +3,141 @@
 from __future__ import annotations
 
 import json
-import os
+import queue
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
-from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 import numpy as np
 import pydeck as pdk
-import requests
 import rasterio
 import streamlit as st
+import torch
 from rasterio.io import MemoryFile
+from rasterio.enums import Resampling
+from rasterio.transform import Affine
 from rasterio.warp import transform_bounds
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
+from src.core import inference as inference_service
 
-
-def _get_api_url() -> str:
-    configured_url = os.getenv("SRM_API_URL")
-    if configured_url:
-        return configured_url
-    try:
-        return str(st.secrets["SRM_API_URL"])
-    except (FileNotFoundError, KeyError):
-        return "http://127.0.0.1:8000/predict"
-
-
-API_URL = _get_api_url()
 ProgressResult = TypeVar("ProgressResult")
+
+
+@st.cache_resource
+def _get_local_model() -> tuple[torch.nn.Module, torch.device]:
+    """Load the existing checkpoint once per Streamlit process."""
+    return inference_service.MODEL, inference_service.DEVICE
+
+
+def _run_local_inference(
+    raster_bytes: bytes,
+    progress_callback: Callable[[int, int], None],
+) -> dict[str, object]:
+    """Run the API pipeline locally for Streamlit-only deployment."""
+    _, device = _get_local_model()
+    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as uploaded:
+        uploaded.write(raster_bytes)
+        input_path = Path(uploaded.name)
+
+    output_path: Path | None = None
+    geojson_path: Path | None = None
+    try:
+        with rasterio.open(input_path) as source:
+            if source.count < 3:
+                raise ValueError(f"Input raster must contain at least 3 bands; received {source.count}")
+            width, height = source.width, source.height
+            read_width, read_height = width, height
+            if max(width, height) > 2048:
+                factor = 2048 / max(width, height)
+                read_width, read_height = max(1, round(width * factor)), max(1, round(height * factor))
+                rgb_data = source.read(
+                    [1, 2, 3],
+                    out_shape=(3, read_height, read_width),
+                    resampling=Resampling.bilinear,
+                    masked=True,
+                )
+            else:
+                rgb_data = source.read([1, 2, 3], masked=True)
+            source_data = inference_service._percentile_normalize_raster(rgb_data)
+            source_profile = source.profile.copy()
+            source_transform = source.transform
+            source_crs = source_profile.get("crs")
+            source_bounds = source.bounds
+
+        input_tensor = torch.from_numpy(source_data).unsqueeze(0).to(device)
+        with torch.no_grad():
+            baseline_array, model_array = inference_service._infer_in_tiles(
+                input_tensor,
+                progress_callback=progress_callback,
+            )
+        del input_tensor
+        inference_service._clear_torch_memory()
+
+        baseline_array = np.clip(baseline_array, 0.0, 1.0)
+        model_array = np.clip(model_array, 0.0, 1.0)
+        matched_array = inference_service._match_color_statistics(model_array, baseline_array)
+        baseline_uint8 = np.clip(baseline_array * 255.0, 0, 255).astype(np.uint8)
+        model_uint8 = np.clip(matched_array * 255.0, 0, 255).astype(np.uint8)
+        psnr = float(peak_signal_noise_ratio(baseline_uint8, model_uint8, data_range=255))
+        ssim = float(
+            structural_similarity(
+                baseline_uint8, model_uint8, channel_axis=-1, data_range=255
+            )
+        )
+
+        with tempfile.NamedTemporaryFile(suffix="_srm_super_resolved.tif", delete=False) as output:
+            output_path = Path(output.name)
+        output_profile = source_profile.copy()
+        output_profile.update(
+            driver="GTiff",
+            width=model_uint8.shape[1],
+            height=model_uint8.shape[0],
+            count=model_uint8.shape[2],
+            dtype="uint8",
+            transform=source_transform * Affine.scale(
+                width / model_uint8.shape[1], height / model_uint8.shape[0]
+            ),
+            compress="deflate",
+            nodata=None,
+        )
+        with rasterio.open(output_path, "w", **output_profile) as destination:
+            destination.write(np.moveaxis(model_uint8, -1, 0))
+
+        with tempfile.NamedTemporaryFile(suffix="_srm_vector_mapping.geojson", delete=False) as vector:
+            geojson_path = Path(vector.name)
+        feature_count = inference_service._extract_vector_mapping(
+            model_uint8,
+            output_profile["transform"],
+            source_crs,
+            str(geojson_path),
+        )
+        return {
+            "output_path": str(output_path),
+            "geojson_path": str(geojson_path),
+            "geojson_feature_count": feature_count,
+            "scale_factor": 4,
+            "width": model_uint8.shape[1],
+            "height": model_uint8.shape[0],
+            "bounds": {
+                "left": source_bounds.left,
+                "bottom": source_bounds.bottom,
+                "right": source_bounds.right,
+                "top": source_bounds.top,
+            },
+            "crs": source_crs.to_string() if source_crs is not None else None,
+            "psnr_db": psnr,
+            "ssim": ssim,
+        }
+    finally:
+        input_path.unlink(missing_ok=True)
+        if output_path is None:
+            if geojson_path is not None:
+                geojson_path.unlink(missing_ok=True)
+        elif geojson_path is None:
+            output_path.unlink(missing_ok=True)
 
 
 def _run_with_progress(
@@ -93,15 +199,6 @@ def _raster_preview(raster_bytes: bytes) -> np.ndarray:
     preview[~finite] = 0.0
 
     return np.moveaxis(preview, 0, -1)
-
-
-def _count_raster_tiles(raster_bytes: bytes, tile_size: int = 512) -> int:
-    """Count bounded inference tiles without loading raster pixels into memory."""
-    with MemoryFile(raster_bytes) as memory_file:
-        with memory_file.open() as dataset:
-            columns = (dataset.width + tile_size - 1) // tile_size
-            rows = (dataset.height + tile_size - 1) // tile_size
-    return max(1, columns * rows)
 
 
 st.set_page_config(
@@ -194,13 +291,12 @@ with st.sidebar:
     st.header("SatFeed")
     st.caption("Satellite Imagery Super-Resolution & GIS Analytics")
     st.markdown(
-        "Upload a four-band multispectral GeoTIFF, then send it to the local "
-        "PyTorch inference backend."
+        "Upload a multispectral GeoTIFF and run tiled PyTorch inference directly "
+        "inside this Streamlit app."
     )
     st.divider()
-    st.subheader("Backend")
-    st.code(API_URL, language="text")
-    st.info("Start the API with: `python app.py`")
+    st.subheader("Runtime")
+    st.info("Inference runs locally in the Streamlit process.")
 
 st.markdown('<div class="satfeed-panel">', unsafe_allow_html=True)
 st.subheader("Upload")
@@ -229,7 +325,6 @@ st.markdown("</div>", unsafe_allow_html=True)
 if run_inference and uploaded_file is not None:
     progress_bar = st.progress(0)
     status_text = st.empty()
-    response: requests.Response | None = None
     try:
         payload = _run_with_progress(
             uploaded_file.getvalue,
@@ -239,14 +334,6 @@ if run_inference and uploaded_file is not None:
             progress_bar,
             status_text,
         )
-        files = {
-            "file": (
-                uploaded_file.name,
-                BytesIO(payload),
-                "image/tiff",
-            )
-        }
-        total_tiles = _count_raster_tiles(payload)
         _run_with_progress(
             lambda: None,
             15,
@@ -256,68 +343,43 @@ if run_inference and uploaded_file is not None:
             status_text,
         )
         with st.spinner("Running super-resolution and sub-pixel classification..."):
-            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="satfeed-stage3") as executor:
+            tile_updates: queue.Queue[tuple[int, int]] = queue.Queue()
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="satfeed-local-inference") as executor:
                 future = executor.submit(
-                    requests.post, API_URL, files=files, timeout=600
+                    _run_local_inference,
+                    payload,
+                    tile_updates.put,
                 )
-                completed_tiles = 0
-                while not future.done():
-                    completed_tiles = min(completed_tiles + 1, max(total_tiles - 1, 0))
+                completed_tiles, total_tiles = 0, 1
+                while not future.done() or not tile_updates.empty():
+                    try:
+                        completed_tiles, total_tiles = tile_updates.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
                     pct = 30 + int((completed_tiles / total_tiles) * 45)
                     status_text.markdown(
                         f"**Stage 3/5**: Running 4x Super-Resolution on Tile "
                         f"{completed_tiles}/{total_tiles}... ({pct}%)"
                     )
                     progress_bar.progress(pct)
-                    time.sleep(0.1)
-                response = future.result()
-                pct = 30 + int((total_tiles / total_tiles) * 45)
+                result = future.result()
+                pct = 75
                 status_text.markdown(
                     f"**Stage 3/5**: Running 4x Super-Resolution on Tile "
                     f"{total_tiles}/{total_tiles}... ({pct}%)"
                 )
                 progress_bar.progress(pct)
-        response.raise_for_status()
         progress_bar.progress(75)
         status_text.markdown("**Stage 4/5**: Matching Spectral Colors & Computing PSNR/SSIM...")
-        result = _run_with_progress(
-            response.json,
-            75,
-            90,
-            "Stage 4/5: Matching Spectral Colors & Computing PSNR/SSIM...",
-            progress_bar,
-            status_text,
-        )
         status_text.markdown("**Stage 5/5: Extracting Road & Building Vector Footprints... (90%)**")
         progress_bar.progress(90)
-    except requests.ConnectionError:
+    except (OSError, RuntimeError, ValueError) as exc:
         status_text.empty()
         progress_bar.empty()
-        st.error("Could not connect to the SRM backend. Start `python app.py` and try again.")
-    except requests.Timeout:
-        status_text.empty()
-        progress_bar.empty()
-        st.error("The backend timed out while processing the raster.")
-    except requests.HTTPError:
-        status_text.empty()
-        progress_bar.empty()
-        detail = response.text[:500] if response is not None else "Unknown backend error"
-        status_code = response.status_code if response is not None else "unknown"
-        st.error(f"Backend rejected the request ({status_code}): {detail}")
-    except requests.RequestException as exc:
-        status_text.empty()
-        progress_bar.empty()
-        st.error(f"SRM request failed: {exc}")
+        st.error(f"Super-resolution failed: {exc}")
     else:
         try:
-            tif_path = _run_with_progress(
-                lambda: Path(result["output_path"]),
-                90,
-                96,
-                "Stage 5/5: Extracting Road & Building Vector Footprints...",
-                progress_bar,
-                status_text,
-            )
+            tif_path = Path(result["output_path"])
             geojson_path = Path(result["geojson_path"])
             geotiff_bytes = tif_path.read_bytes()
             geojson_bytes = geojson_path.read_bytes()

@@ -160,6 +160,15 @@ They also use ephemeral disk storage; generated GeoTIFF and GeoJSON files are
 temporary download artifacts, not permanent storage. Large GeoTIFF inference
 may exceed free CPU/RAM/time limits.
 
+### Direct Streamlit deployment branch
+
+The `deployment-direct-streamlit` branch removes the separate API requirement:
+`ui.py` loads `best_model.pth` and performs tiled inference directly in
+Streamlit. Deploy that branch on Streamlit Community Cloud with main file
+`ui.py`; no `SRM_API_URL` secret or Render service is needed. This is simpler
+and fully free, but Streamlit Cloud's memory and CPU limits make very large
+rasters slower or more likely to fail than the API architecture on `master`.
+
 ### Optional: Generate training patches
 
 ```bash
