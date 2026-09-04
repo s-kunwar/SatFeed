@@ -307,27 +307,42 @@ uploaded_file = st.file_uploader(
     help="The backend expects a four-band GeoTIFF (for example, RGB + NIR).",
 )
 
+demo_path = Path(__file__).resolve().parents[2] / "sample_lr.tif"
+if st.button(
+    "Load Austin demo (fast presentation example)",
+    use_container_width=True,
+    disabled=not demo_path.is_file(),
+):
+    st.session_state["demo_raster_bytes"] = demo_path.read_bytes()
+    st.session_state["demo_raster_name"] = "austin_demo.tif"
+
 if uploaded_file is not None:
     st.success(f"Ready: **{uploaded_file.name}** ({uploaded_file.size / 1024:.1f} KB)")
     st.caption("The input will be normalized before model inference.")
+elif "demo_raster_bytes" in st.session_state:
+    st.success("Ready: **Austin demo** (included sample raster)")
+    st.caption("The small demo is optimized for a quick presentation run.")
 st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown('<div class="satfeed-panel">', unsafe_allow_html=True)
 st.subheader("Processing")
+has_demo = "demo_raster_bytes" in st.session_state
 run_inference = st.button(
     "Run SatFeed Super-Resolution",
     type="primary",
     use_container_width=True,
-    disabled=uploaded_file is None,
+    disabled=uploaded_file is None and not has_demo,
 )
 st.markdown("</div>", unsafe_allow_html=True)
 
-if run_inference and uploaded_file is not None:
+if run_inference and (uploaded_file is not None or has_demo):
     progress_bar = st.progress(0)
     status_text = st.empty()
     try:
         payload = _run_with_progress(
-            uploaded_file.getvalue,
+            uploaded_file.getvalue
+            if uploaded_file is not None
+            else lambda: st.session_state["demo_raster_bytes"],
             0,
             15,
             "Stage 1/5: Loading GeoTIFF & Extracting RGB Bands...",
