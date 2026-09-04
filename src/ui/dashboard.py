@@ -348,7 +348,7 @@ if run_inference and uploaded_file is not None:
                 future = executor.submit(
                     _run_local_inference,
                     payload,
-                    tile_updates.put,
+                    lambda completed, total: tile_updates.put((completed, total)),
                 )
                 completed_tiles, total_tiles = 0, 1
                 while not future.done() or not tile_updates.empty():
