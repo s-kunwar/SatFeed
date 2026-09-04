@@ -187,4 +187,4 @@ The API returns JSON metadata containing output paths, output dimensions, CRS, b
 
 ## License
 
-Add the project license and attribution terms here before distributing SatFeed.
+Distributed under the MIT License. See LICENSE for more information.
